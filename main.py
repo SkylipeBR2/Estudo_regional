@@ -42,9 +42,17 @@ def carregar_base(caminho: str) -> pd.DataFrame:
         if col in df.columns:
             df[col] = df[col].astype(str).str.strip()
 
-    # Cria coluna de Ano-Mês se houver data
+    # Período de rescisão (Ano-Mês)
     if "Data de Rescisão" in df.columns and df["Data de Rescisão"].notna().any():
         df["Ano-Mês"] = df["Data de Rescisão"].dt.to_period("M").astype(str)
+
+    # ===== Safras (cohort) =====
+    if "Data Admissão" in df.columns and df["Data Admissão"].notna().any():
+        df["Admissão YM"] = df["Data Admissão"].dt.to_period("M").astype(str)
+        df["Admissão Ano"] = df["Data Admissão"].dt.year
+
+    if "Data de Rescisão" in df.columns and df["Data de Rescisão"].notna().any():
+        df["Rescisão YM"] = df["Data de Rescisão"].dt.to_period("M").astype(str)
 
     return df
 
@@ -78,10 +86,7 @@ def pct_share(df: pd.DataFrame, by_cols: list[str]):
 
 
 def get_coluna_motivo(df: pd.DataFrame):
-    """
-    Tenta identificar a coluna de motivo caso ela exista na base
-    usando nomes comuns.
-    """
+    """Tenta identificar a coluna de motivo caso ela exista na base usando nomes comuns."""
     candidatos = [
         "Motivo", "Motivo de Desligamento", "Motivo Desligamento",
         "Motivo Rescisão", "Motivo da Rescisão", "Motivo Demissão"
@@ -145,10 +150,9 @@ with st.sidebar:
     raca_opts = sorted(tabela["Raça/Cor"].dropna().unique()) if "Raça/Cor" in tabela.columns else []
     raca_sel = st.multiselect("Raça/Cor", raca_opts, default=raca_opts)
 
-    # Cargo  🔥 novo filtro
+    # Cargo
     cargo_opts = sorted(tabela["Cargo"].dropna().unique()) if "Cargo" in tabela.columns else []
     cargo_sel = st.multiselect("Cargo", cargo_opts, default=cargo_opts)
-
 
 # Aplica filtros
 df = tabela.copy()
@@ -163,6 +167,8 @@ if "Sexo" in df.columns and len(sexo_sel) > 0:
     df = df[df["Sexo"].isin(sexo_sel)]
 if "Raça/Cor" in df.columns and len(raca_sel) > 0:
     df = df[df["Raça/Cor"].isin(raca_sel)]
+if "Cargo" in df.columns and len(cargo_sel) > 0:
+    df = df[df["Cargo"].isin(cargo_sel)]
 
 # ==========================
 # KPIs (fixos no topo)
@@ -211,6 +217,7 @@ tabs = st.tabs([
     "RJ vs Outras",
     "Diretoria / Centro de Custo",
     "Motivos",
+    "Safra (Admissão x Desligamento)",  # NOVA ABA
     "Exportar"
 ])
 
@@ -247,7 +254,6 @@ with tabs[1]:
     else:
         st.info("Coluna 'Regional' não encontrada.")
 
-# --------- Status
 # --------- Status
 with tabs[2]:
     st.markdown("### Composição de desligamentos por Status (por Regional)")
@@ -599,8 +605,93 @@ with tabs[10]:
     else:
         st.info("Não encontrei coluna de **motivo**. Se existir, renomeie para 'Motivo' (ou um dos nomes comuns) ou informe o nome para eu ajustar no código.")
 
-# --------- Exportar
+# --------- Safra (Admissão x Desligamento)
 with tabs[11]:
+    st.markdown("### Safra de Admissão × Mês de Desligamento (Cohort)")
+    cols_ok = {"Admissão YM", "Rescisão YM", "Data Admissão", "Data de Rescisão"}
+    if cols_ok.issubset(df.columns) and df["Admissão YM"].notna().any() and df["Rescisão YM"].notna().any():
+        base = df.dropna(subset=["Admissão YM", "Rescisão YM"]).copy()
+
+        # Heatmap de contagem
+        cohort = base.groupby(["Admissão YM", "Rescisão YM"]).size().reset_index(name="Desligados")
+        st.markdown("**Contagem de desligados por safra (linhas) e mês de desligamento (colunas)**")
+        chart_cohort = (
+            alt.Chart(cohort)
+            .mark_rect()
+            .encode(
+                x=alt.X("Rescisão YM:N", title="Mês de desligamento"),
+                y=alt.Y("Admissão YM:N", title="Safra de admissão"),
+                color=alt.Color("Desligados:Q"),
+                tooltip=["Admissão YM", "Rescisão YM", "Desligados"]
+            )
+            .properties(height=480)
+        )
+        st.altair_chart(chart_cohort, use_container_width=True)
+
+        with st.expander("Ver tabela (contagem) / Baixar CSV"):
+            pivot_contagem = cohort.pivot(index="Admissão YM", columns="Rescisão YM", values="Desligados").fillna(0).astype(int)
+            st.dataframe(pivot_contagem, use_container_width=True)
+            baixar_csv_button(cohort, "Baixar CSV (Cohort - Contagem)", "cohort_contagem.csv")
+
+        st.divider()
+
+        # Heatmap percentual por safra (normaliza cada linha)
+        cohort_pct = cohort.copy()
+        total_por_safra = cohort_pct.groupby("Admissão YM")["Desligados"].transform("sum")
+        cohort_pct["% na Safra"] = np.where(total_por_safra > 0, (cohort_pct["Desligados"] / total_por_safra * 100), 0).round(2)
+
+        st.markdown("**Distribuição % dos desligamentos dentro de cada safra**")
+        chart_cohort_pct = (
+            alt.Chart(cohort_pct)
+            .mark_rect()
+            .encode(
+                x=alt.X("Rescisão YM:N", title="Mês de desligamento"),
+                y=alt.Y("Admissão YM:N", title="Safra de admissão"),
+                color=alt.Color("% na Safra:Q"),
+                tooltip=["Admissão YM", "Rescisão YM", "Desligados", "% na Safra"]
+            )
+            .properties(height=480)
+        )
+        st.altair_chart(chart_cohort_pct, use_container_width=True)
+
+        with st.expander("Ver tabela (percentual por safra) / Baixar CSV"):
+            pivot_pct = cohort_pct.pivot(index="Admissão YM", columns="Rescisão YM", values="% na Safra").fillna(0)
+            st.dataframe(pivot_pct, use_container_width=True)
+            baixar_csv_button(cohort_pct, "Baixar CSV (Cohort - % por Safra)", "cohort_percentual.csv")
+
+        st.divider()
+
+        # Tempo até desligar (meses) por safra — buckets
+        st.markdown("**Tempo até o desligamento (meses) por safra – buckets**")
+        base["Meses até desligar"] = ((base["Data de Rescisão"] - base["Data Admissão"]) / np.timedelta64(1, "M")).round(0)
+        bins = [-1, 3, 6, 12, 24, np.inf]
+        labels = ["0-3", "4-6", "7-12", "13-24", "25+"]
+        base["Bucket Meses"] = pd.cut(base["Meses até desligar"], bins=bins, labels=labels)
+
+        tempo_sf = base.groupby(["Admissão YM", "Bucket Meses"]).size().reset_index(name="Desligados")
+        chart_tempo = (
+            alt.Chart(tempo_sf)
+            .mark_rect()
+            .encode(
+                x=alt.X("Bucket Meses:N", title="Meses até desligar"),
+                y=alt.Y("Admissão YM:N", title="Safra de admissão"),
+                color=alt.Color("Desligados:Q"),
+                tooltip=["Admissão YM", "Bucket Meses", "Desligados"]
+            )
+            .properties(height=420)
+        )
+        st.altair_chart(chart_tempo, use_container_width=True)
+
+        with st.expander("Ver tabela (tempo até desligar) / Baixar CSV"):
+            pivot_tempo = tempo_sf.pivot(index="Admissão YM", columns="Bucket Meses", values="Desligados").fillna(0).astype(int)
+            st.dataframe(pivot_tempo, use_container_width=True)
+            baixar_csv_button(tempo_sf, "Baixar CSV (Tempo até desligar)", "safra_tempo_ate_desligar.csv")
+
+    else:
+        st.info("Para a safra/cohort, preciso de 'Data Admissão' e 'Data de Rescisão' válidas.")
+
+# --------- Exportar
+with tabs[12]:
     st.markdown("### Exportar dados filtrados")
     st.write("Baixe os dados **exatamente** com os filtros aplicados na barra lateral.")
     baixar_csv_button(df, "Baixar CSV (dados filtrados)", "desligados_filtrado.csv")
