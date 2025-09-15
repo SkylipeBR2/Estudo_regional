@@ -102,6 +102,143 @@ def baixar_csv_button(df: pd.DataFrame, label: str, filename: str):
     st.download_button(label=label, data=csv, file_name=filename, mime="text/csv")
 
 
+# ========= Chatbot helpers =========
+def _fmt_pct(x):
+    try:
+        if pd.isna(x):
+            return "—"
+        return f"{float(x):.2f}%"
+    except Exception:
+        return "—"
+
+def resumo_rj_vs_outras(df: pd.DataFrame) -> str:
+    if "Regional" not in df.columns:
+        return "Não encontrei a coluna 'Regional' na base filtrada."
+
+    tmp = df.copy()
+    tmp["Grupo"] = np.where(tmp["Regional"].str.upper() == "REGIONAL RJ", "RJ", "Outras")
+
+    linhas = []
+    # Voluntário x Involuntário (% dentro do grupo)
+    if "Status" in tmp.columns:
+        g = tmp.groupby(["Grupo", "Status"]).size().reset_index(name="Desligados")
+        g["% no Grupo"] = g["Desligados"] / g.groupby("Grupo")["Desligados"].transform("sum") * 100
+        def pick(grupo, status):
+            val = g.loc[(g["Grupo"]==grupo) & (g["Status"]==status), "% no Grupo"]
+            return val.iloc[0] if not val.empty else np.nan
+        rj_vol = pick("RJ", "Voluntário")
+        rj_inv = pick("RJ", "Involuntário")
+        ot_vol = pick("Outras", "Voluntário")
+        ot_inv = pick("Outras", "Involuntário")
+        linhas.append(
+            f"- **Status** · RJ: Voluntário {_fmt_pct(rj_vol)} / Involuntário {_fmt_pct(rj_inv)} | "
+            f"Outras: Voluntário {_fmt_pct(ot_vol)} / Involuntário {_fmt_pct(ot_inv)}"
+        )
+
+    # Tempo médio de casa
+    if "Tempo de Casa" in tmp.columns and tmp["Tempo de Casa"].notna().any():
+        m = tmp.groupby("Grupo")["Tempo de Casa"].mean().round(2)
+        rj_tc = m.get("RJ", np.nan)
+        ot_tc = m.get("Outras", np.nan)
+        linhas.append(f"- **Tempo médio de casa (meses)** · RJ: {rj_tc if pd.notna(rj_tc) else '—'} | Outras: {ot_tc if pd.notna(ot_tc) else '—'}")
+
+    # Top cargos com mais desligamentos (RJ vs Outras)
+    if "Cargo" in tmp.columns:
+        top_rj = tmp.loc[tmp["Grupo"]=="RJ"].groupby("Cargo").size().sort_values(ascending=False).head(3)
+        top_ot = tmp.loc[tmp["Grupo"]=="Outras"].groupby("Cargo").size().sort_values(ascending=False).head(3)
+        linhas.append(f"- **Top cargos (RJ)**: {', '.join(top_rj.index.tolist()) if not top_rj.empty else '—'}")
+        linhas.append(f"- **Top cargos (Outras)**: {', '.join(top_ot.index.tolist()) if not top_ot.empty else '—'}")
+
+    if not linhas:
+        return "Não foi possível comparar RJ vs Outras com as colunas atuais/filtro."
+    return "\n".join(linhas)
+
+
+def responder_pergunta(q: str, df: pd.DataFrame, tabela: pd.DataFrame) -> tuple[str, list[tuple[str, pd.DataFrame]]]:
+    """
+    Retorna (texto_resposta, anexos) onde anexos é uma lista de (título, DataFrame)
+    Usamos df (filtrado) como base principal; tabela (completa) só quando explicitado.
+    """
+    if df is None or df.empty:
+        return "Não há dados após os filtros aplicados. Ajuste os filtros na barra lateral.", []
+
+    ql = q.lower()
+    anexos: list[tuple[str, pd.DataFrame]] = []
+
+    # Totais
+    if any(k in ql for k in ["total", "quant", "qtd", "quanto", "quantos", "qtde"]) and "deslig" in ql:
+        total = len(df)
+        txt = f"Total de desligamentos (dados filtrados): **{total}**."
+        if "regional" in ql and "por" in ql and "Regional" in df.columns:
+            por_reg = df.groupby("Regional").size().sort_values(ascending=False).reset_index(name="Desligados")
+            anexos.append(("Desligados por Regional", por_reg))
+            txt += " Veja a tabela por Regional anexada."
+        return txt, anexos
+
+    # RJ vs Outras
+    if ("rj" in ql and ("outra" in ql or "compar" in ql or "vs" in ql)) or ("por que rj" in ql):
+        return resumo_rj_vs_outras(df), anexos
+
+    # Por cargo
+    if "cargo" in ql:
+        if "Cargo" in df.columns:
+            top_cargo = df.groupby("Cargo").size().sort_values(ascending=False).reset_index(name="Desligados")
+            anexos.append(("Desligados por Cargo (filtrado)", top_cargo))
+            return "Listei os desligamentos por Cargo com base no filtro atual.", anexos
+        else:
+            return "Não encontrei a coluna 'Cargo' na base.", anexos
+
+    # Por status
+    if "status" in ql or "volunt" in ql or "involunt" in ql:
+        if "Status" in df.columns:
+            por_status = df.groupby("Status").size().reset_index(name="Desligados").sort_values("Desligados", ascending=False)
+            anexos.append(("Desligados por Status (filtrado)", por_status))
+            if "regional" in ql and "Regional" in df.columns:
+                prs = df.groupby(["Regional","Status"]).size().reset_index(name="Desligados").sort_values("Desligados", ascending=False)
+                anexos.append(("Desligados por Regional x Status", prs))
+            return "Seguem os desligamentos por Status (e por Regional, se solicitado).", anexos
+        else:
+            return "Não encontrei a coluna 'Status' na base.", anexos
+
+    # Por nível
+    if "nível" in ql or "nivel" in ql:
+        col = "Nível de Hierarquia"
+        if col in df.columns:
+            por_nivel = df.groupby(col).size().reset_index(name="Desligados").sort_values("Desligados", ascending=False)
+            anexos.append((f"Desligados por {col}", por_nivel))
+            return f"Trouxe os desligamentos por **{col}**.", anexos
+        else:
+            return f"Não encontrei a coluna '{col}'.", anexos
+
+    # Sazonalidade
+    if "mês" in ql or "mes" in ql or "sazonal" in ql or "mensal" in ql:
+        if "Ano-Mês" in df.columns:
+            por_mes = df.groupby("Ano-Mês").size().reset_index(name="Desligados").sort_values("Ano-Mês")
+            anexos.append(("Desligados por Mês (filtrado)", por_mes))
+            return "Aqui está a distribuição mensal de desligamentos.", anexos
+        else:
+            return "Não encontrei coluna de período ('Ano-Mês') calculada.", anexos
+
+    # Cohort / Safra
+    if "cohort" in ql or "safra" in ql or ("admiss" in ql and "rescis" in ql):
+        ok_cols = {"Admissão YM", "Rescisão YM"}
+        if ok_cols.issubset(df.columns):
+            c = df.groupby(["Admissão YM", "Rescisão YM"]).size().reset_index(name="Desligados")
+            anexos.append(("Cohort (Admissão YM x Rescisão YM)", c))
+            return "Mostrei a tabela base do cohort (safra x mês de desligamento).", anexos
+        else:
+            return "Para safra/cohort, preciso de 'Admissão YM' e 'Rescisão YM'.", anexos
+
+    # Fallback
+    cols = ", ".join(df.columns.tolist())
+    txt = (
+        "Não identifiquei a intenção exata da sua pergunta. "
+        "Posso responder coisas como **totais**, **RJ vs Outras**, **por Cargo/Status/Nível**, **mensal**, **safra/cohort**.\n\n"
+        f"Colunas disponíveis no recorte atual: {cols}"
+    )
+    return txt, anexos
+
+
 # ==========================
 # Entrada & carregamento
 # ==========================
@@ -218,7 +355,8 @@ tabs = st.tabs([
     "Diretoria / Centro de Custo",
     "Motivos",
     "Safra (Admissão x Desligamento)",  # NOVA ABA
-    "Exportar"
+    "Exportar",
+    "Chatbot 🤖"  # NOVA ABA
 ])
 
 # --------- Visão Geral
@@ -663,7 +801,10 @@ with tabs[11]:
 
         # Tempo até desligar (meses) por safra — buckets
         st.markdown("**Tempo até o desligamento (meses) por safra – buckets**")
-        base["Meses até desligar"] = ((base["Data de Rescisão"] - base["Data Admissão"]) / np.timedelta64(1, "M")).round(0)
+        base = base.dropna(subset=["Data Admissão", "Data de Rescisão"]).copy()
+        base["Meses até desligar"] = (
+            base["Data de Rescisão"].dt.to_period("M") - base["Data Admissão"].dt.to_period("M")
+        ).astype(int)
         bins = [-1, 3, 6, 12, 24, np.inf]
         labels = ["0-3", "4-6", "7-12", "13-24", "25+"]
         base["Bucket Meses"] = pd.cut(base["Meses até desligar"], bins=bins, labels=labels)
@@ -695,6 +836,34 @@ with tabs[12]:
     st.markdown("### Exportar dados filtrados")
     st.write("Baixe os dados **exatamente** com os filtros aplicados na barra lateral.")
     baixar_csv_button(df, "Baixar CSV (dados filtrados)", "desligados_filtrado.csv")
+
+# --------- Chatbot
+with tabs[13]:
+    st.markdown("### Chatbot 🤖 – Pergunte sobre os dados filtrados")
+    st.write("Exemplos: *'quantos desligamentos?'*, *'como está RJ vs outras?'*, *'por cargo?'*, *'por status por regional?'*, *'safra/cohort?'*.")
+
+    if "chat_history" not in st.session_state:
+        st.session_state.chat_history = []
+
+    for role, content in st.session_state.chat_history:
+        with st.chat_message(role):
+            st.markdown(content)
+
+    pergunta = st.chat_input("Digite sua pergunta…")
+    if pergunta:
+        st.session_state.chat_history.append(("user", pergunta))
+        with st.chat_message("user"):
+            st.markdown(pergunta)
+
+        resposta, anexos = responder_pergunta(pergunta, df, tabela)
+
+        with st.chat_message("assistant"):
+            st.markdown(resposta)
+            for titulo, tdf in anexos:
+                st.markdown(f"**{titulo}**")
+                st.dataframe(tdf, use_container_width=True)
+
+        st.session_state.chat_history.append(("assistant", resposta))
 
 st.caption(
     "Obs.: Percentuais aqui representam **participação dentro dos desligados** (denominador = desligados). "
